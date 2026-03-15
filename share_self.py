@@ -9,23 +9,24 @@
 # - Optional Telegram alerts for STRONG BUY / STRONG SELL
 # ========================================================
 
+
 import pandas as pd
 from bdshare import get_historical_data
 import numpy as np
 from datetime import datetime
 import requests
+import time 
 
 # ------------------ Telegram Setup ------------------
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # Replace with your bot token
-CHAT_ID = "YOUR_CHAT_ID"                    # Replace with your chat id
+TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN" 
+CHAT_ID = "YOUR_CHAT_ID"
 
 def send_telegram_message(message):
-    """Send message to Telegram for strong signals."""
-    if TELEGRAM_TOKEN and CHAT_ID:
+    if TELEGRAM_TOKEN != "YOUR_TELEGRAM_BOT_TOKEN":
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": CHAT_ID, "text": message}
         try:
-            requests.post(url, data=payload)
+            requests.post(url, data=payload, timeout=5)
         except:
             pass
 
@@ -38,111 +39,108 @@ stocks = ["BDTHAI","BEXIMCO","GP","SQURPHARMA","BATBC",
 start_date = "2024-01-01"
 end_date = datetime.today().strftime('%Y-%m-%d')
 
-# ------------------ Stock Analysis Function ------------------
 def analyze_stock(symbol):
-    """Analyze a single stock and return summary dictionary."""
     try:
-        df = get_historical_data(start_date,end_date,symbol)
-    except:
-        return None
-    if df is None or df.empty:
-        return None
+        df = get_historical_data(start_date, end_date, symbol)
+        if df is None or df.empty: return None
+        
+        df = df.reset_index()
+        df.columns = [c.lower() for c in df.columns]
+        df['close'] = pd.to_numeric(df['close'], errors='coerce')
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+        df = df.sort_values('date').dropna(subset=['close', 'volume'])
+        
+        if len(df) < 30: return None
 
-    df = df.reset_index()
-    df.columns = [c.lower() for c in df.columns]
-    df['close'] = pd.to_numeric(df['close'], errors='coerce')
-    df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-    df = df.dropna()
+        # --- Indicators ---
+        df['ma9'] = df['close'].rolling(9).mean()
+        df['ma21'] = df['close'].rolling(21).mean()
+        
+        # MACD
+        df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+        df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = df['ema12'] - df['ema26']
+        df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
 
-    # ------------------ Indicators ------------------
-    # Moving averages
-    df['ma9'] = df['close'].rolling(9).mean()
-    df['ma21'] = df['close'].rolling(21).mean()
+        # RSI (Safe Calculation)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        df['rsi'] = 100 - (100 / (1 + (gain / (loss + 1e-9)))) # 1e-9 added to avoid div by zero
 
-    # MACD
-    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = df['ema12'] - df['ema26']
-    df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        # Bollinger Bands
+        df['sma20'] = df['close'].rolling(20).mean()
+        df['std20'] = df['close'].rolling(20).std()
+        df['lower_b'] = df['sma20'] - 2*df['std20']
+        df['upper_b'] = df['sma20'] + 2*df['std20']
 
-    # RSI
-    delta = df['close'].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = -delta.clip(upper=0).rolling(14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
+        # --- Latest Values ---
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+        price, rsi, macd, sig = curr['close'], curr['rsi'], curr['macd'], curr['signal']
+        ma9, ma21, lower_b, upper_b = curr['ma9'], curr['ma21'], curr['lower_b'], curr['upper_b']
 
-    # Bollinger Bands
-    df['sma20'] = df['close'].rolling(20).mean()
-    df['std20'] = df['close'].rolling(20).std()
-    df['lower_b'] = df['sma20'] - 2*df['std20']
-    df['upper_b'] = df['sma20'] + 2*df['std20']
+        # --- Volume Status ---
+        vol_avg = df['volume'].tail(10).mean()
+        vol_ratio = curr['volume'] / vol_avg if vol_avg > 0 else 1
+        
+        if price > prev['close'] and vol_ratio > 1.2:
+            vol_status = "BUYERS ACTIVE"
+        elif price < prev['close'] and vol_ratio > 1.2:
+            vol_status = "SELLERS DOMINATING"
+        else:
+            vol_status = "NEUTRAL"
 
-    # ------------------ Latest Values ------------------
-    price = df['close'].iloc[-1]
-    prev_price = df['close'].iloc[-2]
-    lower_b = df['lower_b'].iloc[-1]
-    upper_b = df['upper_b'].iloc[-1]
-    ma9 = df['ma9'].iloc[-1]
-    ma21 = df['ma21'].iloc[-1]
-    macd = df['macd'].iloc[-1]
-    signal = df['signal'].iloc[-1]
-    rsi = df['rsi'].iloc[-1]
-
-    # ------------------ Volume Status ------------------
-    vol_avg = df['volume'].tail(10).mean()
-    curr_vol = df['volume'].iloc[-1]
-    vol_ratio = curr_vol / vol_avg if vol_avg>0 else 1
-    if price > prev_price and vol_ratio > 1.2:
-        vol_status = "BUYERS ACTIVE"
-    elif price < prev_price and vol_ratio > 1.2:
-        vol_status = "SELLERS DOMINATING"
-    else:
-        vol_status = "MARKET NEUTRAL"
-
-    # ------------------ Decision ------------------
-    if (price <= lower_b or rsi < 35) and price > prev_price:
-        decision = "STRONG BUY"
-    elif macd > signal and ma9 > ma21:
-        decision = "BUY / HOLD"
-    elif rsi > 80 or price >= upper_b:
-        decision = "STRONG SELL"
-    elif ma9 < ma21 or macd < signal:
-        decision = "SELL / AVOID"
-    else:
+        # --- Decision Engine ---
         decision = "WAIT"
+        if (price <= lower_b or rsi < 35) and price > prev['close']:
+            decision = "STRONG BUY"
+        elif macd > sig and ma9 > ma21:
+            decision = "BUY / HOLD"
+        elif rsi > 75 or price >= upper_b:
+            decision = "STRONG SELL"
+        elif ma9 < ma21 or macd < sig:
+            decision = "SELL / AVOID"
 
-    # ------------------ Sell Target & Stop Loss ------------------
-    sell_target = upper_b if decision in ["STRONG BUY","BUY / HOLD"] else lower_b
-    stop_loss = lower_b if decision in ["STRONG BUY","BUY / HOLD"] else upper_b
+        # --- Target & Stop Loss ---
+        
+        sell_target = round(upper_b, 2) if decision in ["STRONG BUY", "BUY / HOLD"] else round(lower_b, 2)
+        stop_loss = round(lower_b, 2) if decision in ["STRONG BUY", "BUY / HOLD"] else round(upper_b, 2)
 
-    # ------------------ Telegram Alert ------------------
-    if decision in ["STRONG BUY","STRONG SELL"]:
-        msg = f"{symbol} -> {decision}\nPrice: {round(price,2)}\nTarget: {round(sell_target,2)}\nStop Loss: {round(stop_loss,2)}\nVolume: {vol_status}"
-        send_telegram_message(msg)
+        # Telegram Alert for strong signals
+        if decision in ["STRONG BUY", "STRONG SELL"]:
+            alert = f"🚨 {symbol} -> {decision}\n💰 Price: {price}\n🎯 Target: {sell_target}\n📉 SL: {stop_loss}\n📊 Vol: {vol_status}"
+            send_telegram_message(alert)
 
-    return {
-        "Stock": symbol,
-        "Price": round(price,2),
-        "Volume_Status": vol_status,
-        "Decision": decision,
-        "Sell_Target": round(sell_target,2),
-        "Stop_Loss": round(stop_loss,2)
-    }
+        return {
+            "Stock": symbol,
+            "Price": price,
+            "RSI": round(rsi, 2),
+            "Vol_Status": vol_status,
+            "Decision": decision,
+            "Target": sell_target,
+            "StopLoss": stop_loss
+        }
+    except Exception as e:
+        print(f"Error analyzing {symbol}: {e}")
+        return None
 
-# ------------------ Run Top 20 Scanner ------------------
+# --- Main Run ---
+print("\nScanning DSE Top 20 Stocks... Please wait.\n")
 results = []
-for stock in stocks:
-    res = analyze_stock(stock)
-    if res:
-        results.append(res)
+for s in stocks:
+    analysis = analyze_stock(s)
+    if analysis:
+        results.append(analysis)
+    time.sleep(0.5) 
 
 df_result = pd.DataFrame(results)
 
-# ------------------ VS Code Horizontal Display ------------------
+# Display Formatting
 pd.set_option('display.max_columns', None)
-pd.set_option('display.width', 120)
-pd.set_option('display.colheader_justify', 'center')
+pd.set_option('display.width', 1000)
 
-print("\n====== DSE Top 20 Scanner (Horizontal + Telegram Alerts) ======\n")
+print("="*100)
 print(df_result.to_string(index=False))
+print("="*100)
+
